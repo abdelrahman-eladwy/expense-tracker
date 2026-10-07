@@ -26,7 +26,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build:
     name: Build (lint)
-    runs-on: appsec
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -57,7 +57,7 @@ jobs:
   sca:
     name: SCA (Trivy)
     needs: build
-    runs-on: appsec
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -76,7 +76,7 @@ jobs:
   sast:
     name: SAST (Semgrep)
     needs: build
-    runs-on: appsec
+    runs-on: ubuntu-latest
     container:
       image: semgrep/semgrep:latest
     steps:
@@ -108,7 +108,7 @@ jobs:
     needs: [sca, sast]
     # Run even when the scans fail (but not when the run is cancelled).
     if: ${{ !cancelled() }}
-    runs-on: appsec
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
