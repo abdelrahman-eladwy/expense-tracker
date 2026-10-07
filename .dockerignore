@@ -1,0 +1,11 @@
+.git
+.github
+.gitignore
+.gitattributes
+*.md
+Dockerfile
+.dockerignore
+.trivyignore
+# Never bake secrets or DB bootstrap scripts into the image
+config/.env
+database

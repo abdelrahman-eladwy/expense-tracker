@@ -1,0 +1,2 @@
+# Apache must start as root to bind port 80; it drops to www-data for request handling.
+AVD-DS-0002

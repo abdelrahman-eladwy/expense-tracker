@@ -1,0 +1,253 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: expense-tracker
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # PHP is interpreted, so there is nothing to compile. The "build" stage checks
+  # that every file parses and installs Composer dependencies if the project
+  # ever adds a composer.json.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo_mysql
+          tools: composer
+
+      - name: Install Composer dependencies (if any)
+        run: |
+          if [ -f composer.json ]; then
+            composer install --no-interaction --prefer-dist --no-progress
+          else
+            echo "No composer.json - nothing to install."
+          fi
+
+      - name: PHP syntax check
+        run: |
+          find . -name '*.php' -not -path './vendor/*' -not -path './.git/*' -print0 \
+            | xargs -0 -n1 php -l > /dev/null
+          echo "All PHP files parsed successfully."
+
+  # ---------------------------------------------------------------------------
+  # SCA: known-vulnerable dependencies, plus secrets and Dockerfile misconfig.
+  # (The image's OS/PHP packages are scanned after the image is built.)
+  # ---------------------------------------------------------------------------
+  sca:
+    name: SCA (Trivy)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          format: table
+
+  # ---------------------------------------------------------------------------
+  # SAST: Semgrep with PHP, security-audit and secrets rulesets.
+  # ---------------------------------------------------------------------------
+  sast:
+    name: SAST (Semgrep)
+    needs: build
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Semgrep scan
+        run: |
+          semgrep scan \
+            --config p/php \
+            --config p/security-audit \
+            --config p/secrets \
+            --severity ERROR \
+            --error \
+            --sarif-output=semgrep.sarif
+
+      - name: Upload SARIF report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Build the image, scan it, and hand it to the deploy job as an artifact.
+  # ---------------------------------------------------------------------------
+  docker-build:
+    name: Build Docker image
+    needs: [sca, sast]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t "$IMAGE_NAME:$IMAGE_TAG" -t "$IMAGE_NAME:latest" .
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table
+
+      - name: Export image
+        run: docker save "$IMAGE_NAME:$IMAGE_TAG" "$IMAGE_NAME:latest" | gzip > image.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: image.tar.gz
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Deploy: MySQL container + Apache/PHP container on a shared Docker network.
+  # Only runs on pushes to main. The DB and app are separate steps of ONE job
+  # because both containers must live on the same Docker host/network; separate
+  # jobs on GitHub-hosted runners would land on different VMs.
+  #
+  # Set repo variable DEPLOY_RUNNER to a self-hosted runner label to deploy to
+  # your own server; otherwise ubuntu-latest is used (ephemeral smoke deploy).
+  # Required secrets: DB_ROOT_PASSWORD, DB_PASSWORD.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy (MySQL + Apache)
+    needs: docker-build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ${{ vars.DEPLOY_RUNNER || 'ubuntu-latest' }}
+    environment: production
+    env:
+      NETWORK: expense-net
+      DB_CONTAINER: expense-db
+      APP_CONTAINER: expense-app
+      DB_VOLUME: expense-db-data
+      DB_NAME: expense_tracker
+      DB_USER: expense_user
+      APP_PORT: ${{ vars.APP_PORT || '8080' }}
+      MYSQL_ROOT_PASSWORD: ${{ secrets.DB_ROOT_PASSWORD }}
+      DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required secrets
+        run: |
+          [ -n "$MYSQL_ROOT_PASSWORD" ] || { echo "::error::Secret DB_ROOT_PASSWORD is not set"; exit 1; }
+          [ -n "$DB_PASSWORD" ] || { echo "::error::Secret DB_PASSWORD is not set"; exit 1; }
+          # DB_PASSWORD is substituted into a SQL file with sed, so keep it simple.
+          if printf '%s' "$DB_PASSWORD" | grep -q "[^A-Za-z0-9._@#%+=-]"; then
+            echo "::error::DB_PASSWORD may only contain letters, digits and . _ @ # % + = -"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load image
+        run: gunzip -c image.tar.gz | docker load
+
+      - name: Create network and volume
+        run: |
+          docker network inspect "$NETWORK" >/dev/null 2>&1 || docker network create "$NETWORK"
+          docker volume inspect "$DB_VOLUME" >/dev/null 2>&1 || docker volume create "$DB_VOLUME"
+
+      # --- MySQL ------------------------------------------------------------
+      # The app is PHP + PDO MySQL, so MySQL (not MongoDB) is the database.
+      # database/schema.sql is reused with its host-specific user lines adapted:
+      # the app user may connect from any host on the Docker network ('%') and
+      # keeps the least-privilege grants (SELECT/INSERT/UPDATE/DELETE) from the
+      # schema. The init script only runs on the first start of an empty volume.
+      - name: Deploy MySQL
+        run: |
+          mkdir -p "$RUNNER_TEMP/db-init"
+          sed -e "s/'expense_user'@'localhost'/'expense_user'@'%'/g" \
+              -e "s|'your_password'|'${DB_PASSWORD}'|g" \
+              database/schema.sql > "$RUNNER_TEMP/db-init/01-schema.sql"
+
+          if docker inspect "$DB_CONTAINER" >/dev/null 2>&1; then
+            docker start "$DB_CONTAINER" >/dev/null
+          else
+            docker run -d --name "$DB_CONTAINER" \
+              --network "$NETWORK" \
+              --restart unless-stopped \
+              -e MYSQL_ROOT_PASSWORD \
+              -e MYSQL_DATABASE="$DB_NAME" \
+              -v "$DB_VOLUME":/var/lib/mysql \
+              -v "$RUNNER_TEMP/db-init":/docker-entrypoint-initdb.d:ro \
+              --health-cmd='mysqladmin ping -h 127.0.0.1 -uroot -p"$MYSQL_ROOT_PASSWORD" --silent' \
+              --health-interval=5s --health-timeout=5s --health-retries=24 \
+              mysql:8.4
+          fi
+
+          echo "Waiting for MySQL to become healthy..."
+          for i in $(seq 1 40); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' "$DB_CONTAINER")
+            [ "$status" = "healthy" ] && { echo "MySQL is healthy."; exit 0; }
+            sleep 3
+          done
+          docker logs "$DB_CONTAINER" | tail -50
+          echo "::error::MySQL did not become healthy"
+          exit 1
+
+      # --- Apache + PHP -----------------------------------------------------
+      - name: Deploy application
+        run: |
+          docker rm -f "$APP_CONTAINER" >/dev/null 2>&1 || true
+          docker run -d --name "$APP_CONTAINER" \
+            --network "$NETWORK" \
+            --restart unless-stopped \
+            -p "$APP_PORT":80 \
+            -e DB_HOST="$DB_CONTAINER" \
+            -e DB_PORT=3306 \
+            -e DB_NAME \
+            -e DB_USER \
+            -e DB_PASSWORD \
+            "$IMAGE_NAME:$IMAGE_TAG"
+
+      - name: Smoke test (Browser -> Apache -> PHP -> MySQL)
+        run: |
+          for i in $(seq 1 20); do
+            if body=$(curl -fsS "http://localhost:$APP_PORT/health.php"); then
+              echo "$body"
+              echo "$body" | grep -q "Status:        OK" && exit 0
+            fi
+            sleep 3
+          done
+          docker logs "$APP_CONTAINER" | tail -50
+          echo "::error::Health check failed"
+          exit 1
+
+      - name: Show container state on failure
+        if: failure()
+        run: docker ps -a --filter "name=expense-"
