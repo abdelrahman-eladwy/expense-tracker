@@ -141,15 +141,14 @@ jobs:
   # because both containers must live on the same Docker host/network; separate
   # jobs on GitHub-hosted runners would land on different VMs.
   #
-  # Set repo variable DEPLOY_RUNNER to a self-hosted runner label to deploy to
-  # your own server; otherwise ubuntu-latest is used (ephemeral smoke deploy).
+  # Runs on the self-hosted runner labelled "appsec".
   # Required secrets: DB_ROOT_PASSWORD, DB_PASSWORD.
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy (MySQL + Apache)
     needs: docker-build
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-    runs-on: ${{ vars.DEPLOY_RUNNER || 'ubuntu-latest' }}
+    runs-on: [self-hosted, appsec]
     environment: production
     env:
       NETWORK: expense-net
