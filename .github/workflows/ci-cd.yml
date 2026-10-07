@@ -101,14 +101,17 @@ jobs:
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
-  # Build the image, scan it, and hand it to the deploy job as an artifact.
+  # Build and scan the image on the appsec runner. The deploy job runs on the
+  # same runner and uses the image straight from its local Docker store.
   # ---------------------------------------------------------------------------
   docker-build:
     name: Build Docker image
     needs: [sca, sast]
     # Run even when the scans fail (but not when the run is cancelled).
-    if: ${{ !cancelled() }}
-    runs-on: appsec
+    # Pushes to main only, so pull requests never execute on the self-hosted runner.
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    # Same runner as the deploy job: the image stays in its local Docker store.
+    runs-on: [self-hosted, appsec]
     steps:
       - uses: actions/checkout@v4
 
@@ -116,7 +119,7 @@ jobs:
         run: docker build -t "$IMAGE_NAME:$IMAGE_TAG" -t "$IMAGE_NAME:latest" .
 
       - name: Trivy image scan
-        # Findings are reported but do not stop the image from being exported.
+        # Findings are reported but do not stop the deploy.
         continue-on-error: true
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -126,22 +129,13 @@ jobs:
           exit-code: '1'
           format: table
 
-      - name: Export image
-        run: docker save "$IMAGE_NAME:$IMAGE_TAG" "$IMAGE_NAME:latest" | gzip > image.tar.gz
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: docker-image
-          path: image.tar.gz
-          retention-days: 1
-
   # ---------------------------------------------------------------------------
   # Deploy: MySQL container + Apache/PHP container on a shared Docker network.
   # Only runs on pushes to main. The DB and app are separate steps of ONE job
-  # because both containers must live on the same Docker host/network; separate
-  # jobs on GitHub-hosted runners would land on different VMs.
+  # because both containers must live on the same Docker host/network.
   #
-  # Runs on the self-hosted runner labelled "appsec".
+  # Runs on the self-hosted runner labelled "appsec" (use a single runner with
+  # that label so build and deploy share one Docker image store).
   # Required secrets: DB_ROOT_PASSWORD, DB_PASSWORD.
   # ---------------------------------------------------------------------------
   deploy:
@@ -173,13 +167,6 @@ jobs:
             echo "::error::DB_PASSWORD may only contain letters, digits and . _ @ # % + = -"
             exit 1
           fi
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: docker-image
-
-      - name: Load image
-        run: gunzip -c image.tar.gz | docker load
 
       - name: Create network and volume
         run: |
